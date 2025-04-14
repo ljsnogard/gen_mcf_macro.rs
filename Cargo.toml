@@ -1,0 +1,20 @@
+[package]
+name = "gen_mcf_macro"
+version = "0.1.0"
+edition = "2024"
+
+authors = ["lino <lino_snsalias@outlook.com>"]
+description = "Macro to generate code and types needed to implent TrMayCancel."
+repository = "https://github.com/ljsnogard/gen_mcf_macro.rs"
+keywords = []
+categories = ["no-std"]
+license = "MIT/Apache-2.0"
+readme = "README.md"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
