@@ -1,7 +1,7 @@
 use core::{
     pin::Pin,
     ptr::NonNull,
-    task::{Contex, Poll},
+    task::{Context, Poll},
 };
 
 trait TrCancellationToken {}
@@ -12,9 +12,13 @@ impl NonCancellableToken {
         todo!()
     }
 }
+impl TrCancellationToken for NonCancellableToken
+{}
 
 type R = usize;
 
+// The last parameter must be `cancel: Pin<&'f mut C>`
+// and the last part of the where clause must be `C: TrCancellationToken`
 async fn do_thing_async<'f, A, B, C>(
     a: &'f mut A,
     b: &'f mut B,
@@ -30,16 +34,15 @@ where
     todo!()
 }
 
-pub struct DoThingAsync<'a, A, B>
+pub struct DoThingAsync<'a, A, B>(
+    &'a mut A,    // 1st arg type of do_thing_async
+    &'a mut B,    // 2nd arg type of do_thing_async
+    usize,        // 3rd arg type of do_thing_async
+    Result<A, B>, // 4th arg type of do_thing_async
+)
 where
     A: Send,
-    B: Sync,
-{
-    a: &'a mut A,
-    b: &'a mut B,
-    l: usize,
-    x: Result<A, B>,
-}
+    B: Sync;
 
 pub struct DoThingFuture<'a, A, B, C>
 where
@@ -47,12 +50,9 @@ where
     B: Sync,
     C: TrCancellationToken,
 {
-    a: &'a mut A,
-    b: &'a mut B,
-    l: usize,
-    x: Result<A, B>,
-    cancel: Pin<&'a mut C>,
-    s: Option<DothingFutureState<'a, C, A, B>>,
+    params_: DoThingAsync<'a, A, B>,
+    cancel_: Pin<&'a mut C>,
+    fstate_: Option<DothingFutureState<'a, A, B, C>>,
 }
 
 struct DothingFutureState<'a, C, A, B>(Pin<&'a mut DoThingFuture<'a, A, B, C>>)
@@ -71,12 +71,9 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         DoThingFuture {
-            a: self.a,
-            b: self.b,
-            l: self.l,
-            x: self.x,
-            cancel: NonCancellableToken::shared(), // when no cancellation specified, use `NonCancellableToken`
-            s: Option::None,
+            params_: self,
+            cancel_: NonCancellableToken::shared(), // when no cancellation specified, use `NonCancellableToken`
+            fstate_: Option::None,
         }
     }
 }
@@ -95,13 +92,10 @@ where
     where
         C: TrCancellationToken,
     {
-                DoThingFuture {
-            a: self.a,
-            b: self.b,
-            l: self.l,
-            x: self.x,
-            cancel: cancel, // use the specified cancel token
-            s: Option::None,
+        DoThingFuture {
+            params_: self,
+            cancel_: cancel, // use the specified cancel token
+            fstate_: Option::None,
         }
     }
 }
@@ -116,25 +110,23 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = unsafe {
-            let p = self.as_mut().get_unchecked_mut();
-            NonNull::new_unchecked(p)
+            let p = self.get_unchecked_mut();
+            ::core::ptr::NonNull::new_unchecked(p)
         };
         loop {
-            let mut p = unsafe {
-                let ptr = &mut this.as_mut().future_;
-                NonNull::new_unchecked(ptr)
+            let mut state_field_ptr = unsafe {
+                let ptr = &mut this.as_mut().fstate_;
+                ::core::ptr::NonNull::new_unchecked(ptr)
             };
-            let opt_f = unsafe { p.as_mut() };
-            if let Option::Some(f) = opt_f {
-                let f_pinned = unsafe { Pin::new_unchecked(f) };
-                break f_pinned.poll(cx)
+            let opt_state = unsafe { state_field_ptr.as_mut() };
+            if let Option::Some(state) = opt_state {
+                let state_field_pin = unsafe { Pin::new_unchecked(state) };
+                break state_field_pin.poll(cx)
             } else {
-                let h = FutImpl::new(unsafe { 
-                    Pin::new_unchecked(this.as_mut())
-                });
-                let f = h();
-                let opt = unsafe { p.as_mut() };
-                *opt = Option::Some(f);
+                let state = DoThingFutureState(unsafe { Pin::new_unchecked(this.as_mut()) });
+                let future = state();
+                let state_field_mut = unsafe { state_field_ptr.as_mut() };
+                *state_field_mut = Option::Some(future);
             }
         }
     }
@@ -155,29 +147,7 @@ where
         _: (),
     ) -> Self::CallOnceFuture {
         let f = unsafe { self.0.get_unchecked_mut() };
-        Self::call_once(
-            f.a,
-            f.b,
-            f.l,
-            f.x,
-            f.cancel,
-        )
-    }
-}
-
-impl<'a, A, B, C> DoThingFutureState<'a, A, B, C>
-where
-    A: Send,
-    B: Sync,
-    C: TrCancellationToken,
-{
-    async fn call_once(
-        a: &'f mut A,
-        b: &'f mut B,
-        l: usize,
-        x: Result<A, B>,
-        cancel: Pin<&'f mut C>,
-    ) -> R {
-        self::do_thing_async(a, b, l, x, cancel).await
+        let p = &mut f.params_;
+        self::do_thing_async(p.0, p.1, p.2, p.3, f.cancel_)
     }
 }
