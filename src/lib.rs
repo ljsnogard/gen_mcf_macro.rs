@@ -120,6 +120,8 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
         }
     }
 
+    let field_indices: Vec<syn::Index> = (0..args.len()).map(syn::Index::from).collect();
+
     let async_struct = format_ident!("{}Async", prefix_ident);
     let future_struct = format_ident!("{}Future", prefix_ident);
     let state_struct = format_ident!("{}FutureState", prefix_ident);
@@ -143,23 +145,23 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
         {
             params_: #async_struct<#lt, #(#generics_no_cancel),*>,
             cancel_: #cancel_type,
-            fstate_: Option<#state_struct<#lt, #(#generics_all),*,>>,
+            future_: Option<<#state_struct<#lt, #(#generics_all),*,> as ::core::ops::AsyncFnOnce<()>>::CallOnceFuture>,
         }
 
-        struct #state_struct<#lt, #(#generics_all),*,>(#cancel_type)
+        struct #state_struct<#lt, #(#generics_all),*,>(::core::pin::Pin<&#lt mut #future_struct<#lt, #(#generics_all),*,>>)
         #where_clause;
 
         impl<#lt, #(#generics_no_cancel),*> ::core::future::IntoFuture for #async_struct<#lt, #(#generics_no_cancel),*>
         #where_clause_no_cancel
         {
-            type IntoFuture = #future_struct<#lt, #(#generics_no_cancel),*, NonCancellableToken>;
+            type IntoFuture = #future_struct<#lt, #(#generics_no_cancel),*, ::abs_sync::cancellation::NonCancellableToken>;
             type Output = #output_ty;
 
             fn into_future(self) -> Self::IntoFuture {
                 #future_struct {
                     params_: self,
-                    cancel_: ::abs_sync::cancellation::NonCancellableToken::shared(),
-                    fstate_: Option::None,
+                    cancel_: ::abs_sync::cancellation::NonCancellableToken::pinned(),
+                    future_: Option::None,
                 }
             }
         }
@@ -169,17 +171,17 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
         {
             type MayCancelOutput = #output_ty;
 
-            fn may_cancel_with<'f, C>(
+            fn may_cancel_with<'cancel_, C: ::abs_sync::cancellation::TrCancellationToken>(
                 self,
-                cancel: ::core::pin::Pin<&'f mut C>,
+                cancel: ::core::pin::Pin<&'cancel_ mut C>,
             ) -> impl ::core::future::Future<Output = Self::MayCancelOutput>
             where
-                C: ::abs_sync::cancellation::TrCancellationToken,
+                Self:'cancel_,
             {
                 #future_struct {
                     params_: self,
                     cancel_: cancel,
-                    fstate_: Option::None,
+                    future_: Option::None,
                 }
             }
         }
@@ -198,21 +200,21 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
                     ::core::ptr::NonNull::new_unchecked(p)
                 };
                 loop {
-                    let mut state_field_ptr = unsafe {
-                        let ptr = &mut this.as_mut().fstate_;
+                    let mut fut_field_ptr = unsafe {
+                        let ptr = &mut this.as_mut().future_;
                         ::core::ptr::NonNull::new_unchecked(ptr)
                     };
-                    let opt_state = unsafe { state_field_ptr.as_mut() };
-                    if let Option::Some(state) = opt_state {
-                        let state_pin = unsafe { ::core::pin::Pin::new_unchecked(state) };
-                        break state_pin.poll(cx)
+                    let opt_fut = unsafe { fut_field_ptr.as_mut() };
+                    if let Option::Some(fut) = opt_fut {
+                        let fut_pin = unsafe { ::core::pin::Pin::new_unchecked(fut) };
+                        break fut_pin.poll(cx)
                     } else {
-                        let state = BuffPeekInputFutureState::new(unsafe { 
+                        let state = #state_struct(unsafe { 
                             ::core::pin::Pin::new_unchecked(this.as_mut())
                         });
-                        let future = state();
-                        let state_field_mut = unsafe { state_field_ptr.as_mut() };
-                        *state_field_mut = Option::Some(future);
+                        let fut = AsyncFnOnce::async_call_once(state, ());
+                        let fut_field_mut = unsafe { fut_field_ptr.as_mut() };
+                        *fut_field_mut = Option::Some(fut);
                     }
                 }
             }
@@ -227,7 +229,7 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
             extern "rust-call" fn async_call_once(self, _: ()) -> Self::CallOnceFuture {
                 let f = unsafe { self.0.get_unchecked_mut() };
                 let p = &mut f.params_;
-                self::#fn_ident(#(&mut p.#args),*, f.cancel_)
+                self::#fn_ident(#(p.#field_indices),*, f.cancel_.as_mut())
             }
         }
     };
