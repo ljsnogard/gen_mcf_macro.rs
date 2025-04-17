@@ -3,13 +3,15 @@
 Assumed to work with following unstable featurs:
 
 ```rust
+// Allow for implementation of the AsyncFn*
 #![feature(async_fn_traits)]
-#![feature(impl_trait_in_assoc_type)]
+
+// To enable `extern "rust-call" fn` which is used in `impl AsyncFnOnce`
 #![feature(unboxed_closures)]
 
-#![feature(sync_unsafe_cell)]
-#![feature(try_trait_v2)]
+// To enable `type CallOnceFuture = impl ::core::future::Future<Output = Self::Output>;`
 #![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 ```
 
 ## Usage
