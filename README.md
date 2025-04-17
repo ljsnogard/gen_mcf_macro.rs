@@ -1,6 +1,6 @@
 ## gen_mcf_macro
 
-Assumed to work with following unstable featurs:
+Assumed to work with following unstable features:
 
 ```rust
 // Allow for implementation of the AsyncFn*

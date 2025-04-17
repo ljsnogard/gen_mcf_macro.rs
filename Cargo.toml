@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
-description = "Macro to generate code and types needed to implent TrMayCancel."
 repository = "https://github.com/ljsnogard/gen_mcf_macro.rs"
 keywords = []
 categories = ["no-std"]
 license = "MIT/Apache-2.0"
 readme = "README.md"
+description = """
+Macro to generate codes and types needed to implement `Future` and `TrMayCancel`
+in a pattern that supports graceful cancellation in async programming.
+"""
 
 [lib]
 proc-macro = true
