@@ -148,9 +148,11 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
             future_: Option<<#state_struct<#lt, #(#generics_all),*,> as ::core::ops::AsyncFnOnce<()>>::CallOnceFuture>,
         }
 
+        // Declair #state_struct
         struct #state_struct<#lt, #(#generics_all),*,>(::core::pin::Pin<&#lt mut #future_struct<#lt, #(#generics_all),*,>>)
         #where_clause;
 
+        // Implement `IntoFuture` for #async_struct
         impl<#lt, #(#generics_no_cancel),*> ::core::future::IntoFuture for #async_struct<#lt, #(#generics_no_cancel),*>
         #where_clause_no_cancel
         {
@@ -166,6 +168,7 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
             }
         }
 
+        // Implement `TrMayCancel<'a>` for #async_struct
         impl<#lt, #(#generics_no_cancel),*> ::abs_sync::cancellation::TrMayCancel<#lt> for #async_struct<#lt, #(#generics_no_cancel),*>
         #where_clause_no_cancel
         {
@@ -186,6 +189,7 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
             }
         }
 
+        // Implement `Future` for #future_struct
         impl<#lt, #(#generics_all),*> ::core::future::Future for #future_struct<#lt, #(#generics_all),*>
         #where_clause
         {
