@@ -33,13 +33,13 @@ async fn do_thing_async<'f, A, B, C>(
     l: usize,               // copy, ok
     x: &'f Result<A, B>,    // see rule 4
     cancel: Pin<&'f mut C>, // see rule 2
-) -> R
+) -> usize
 where
     A: Send,
     B: Sync,
     C: TrCancellationToken,
 {
-    // ...
+    42
 }
 
 ```
@@ -53,7 +53,7 @@ async fn do_thing_async<'f, A, B, C>(
     b: &'f mut B,
     l: usize,
     x: &'f Result<A, B>,
-    cancel: Pin<&'f mut C>,
+    cancel: &'f mut C,
 ) -> usize
 where
     A: Send,
@@ -127,7 +127,7 @@ where
         C: ::abs_sync::cancellation::TrCancellationToken,
     >(
         self,
-        cancel: ::core::pin::Pin<&'cancel_ mut C>,
+        cancel: &'cancel_ mut C,
     ) -> impl ::core::future::Future<Output = Self::MayCancelOutput>
     where
         Self: 'cancel_,
@@ -185,7 +185,7 @@ where
     extern "rust-call" fn async_call_once(self, _: ()) -> Self::CallOnceFuture {
         let f = unsafe { self.0.get_unchecked_mut() };
         let p = &mut f.params_;
-        self::do_thing_async(p.0, p.1, p.2, p.3, f.cancel_.as_mut())
+        self::do_thing_async(p.0, p.1, p.2, p.3, f.cancel_)
     }
 }
 

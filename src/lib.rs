@@ -2,7 +2,7 @@ use syn::{
     parse_macro_input,
     parse_quote,
     punctuated::Punctuated,
-    FnArg, GenericParam, ItemFn, PatType, Path, Token, Type, TypePath, WhereClause,
+    FnArg, GenericParam, ItemFn, PatType, Path, Token, Type, WhereClause,
 };
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -50,8 +50,8 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
         }
     };
 
-    let inputs = &input_fn.sig.inputs;
-    let output = &input_fn.sig.output;
+    let sig_inputs = &input_fn.sig.inputs;
+    let sig_output = &input_fn.sig.output;
 
     // Extract lifetime
     let mut lifetimes = vec![];
@@ -95,19 +95,34 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
     let mut cancel_type = None;
     // let mut cancel_pat = None;
 
-    for (i, input) in inputs.iter().enumerate() {
-        match input {
+    for (i, input_arg) in sig_inputs.iter().enumerate() {
+        match input_arg {
             FnArg::Typed(PatType { pat, ty, .. }) => {
-                let is_last = i == inputs.len() - 1;
+                let is_last = i == sig_inputs.len() - 1;
 
                 if is_last {
-                    // Expect: Pin<&'f mut C>
-                    if let Type::Path(TypePath { path, .. }) = &**ty {
-                        if path.segments.last().unwrap().ident != "Pin" {
-                            panic!("Last argument must be Pin<&'f mut C>");
+                    // Expect: &'f mut C
+                    if let Type::Reference(cancel_type_ref) = &**ty {
+                        if cancel_type_ref.mutability.is_none() {
+                            panic!("mut not found: Last argument must be &'_ mut C");
+                        }
+                        let Option::Some(lt_arg) = cancel_type_ref.lifetime.as_ref() else {
+                            panic!("lifetime missing: Last argument must have lifetime");
+                        };
+                        if lt_arg.ident != lt.ident {
+                            panic!("lifetime mismatch: Last argument must contain the only lifetime");
+                        }
+                        let Type::Path(generic_cancel_type_path) = cancel_type_ref.elem.as_ref() else {
+                            panic!("cancel token type must be simple type token");
+                        };
+                        if generic_cancel_type_path.path.segments.len() != 1 {
+                            panic!("cancel token type should be generic type");
+                        }
+                        let cancel_tok_type_ident = &generic_cancel_type_path.path.segments[0].ident;
+                        if !generics_all.contains(cancel_tok_type_ident) {
+                            panic!("cancel token type mismatch");
                         }
                     }
-
                     cancel_type = Some(ty.clone());
                     // cancel_pat = Some(pat.clone());
                 } else {
@@ -129,7 +144,7 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
     // Final generic types
     // let gen_params = quote! { #(#generics_all),* };
     // let gen_params_with_lt = quote! { #lt, #(#generics_all),* };
-    let output_ty = match output {
+    let output_ty = match sig_output {
         syn::ReturnType::Type(_, ty) => ty,
         _ => panic!("Expected function to return a value"),
     };
@@ -162,21 +177,21 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
             fn into_future(self) -> Self::IntoFuture {
                 #future_struct {
                     params_: self,
-                    cancel_: ::abs_sync::cancellation::NonCancellableToken::pinned(),
+                    cancel_: ::abs_sync::cancellation::NonCancellableToken::shared_mut(),
                     future_: Option::None,
                 }
             }
         }
 
         // Implement `TrMayCancel<'a>` for #async_struct
-        impl<#lt, #(#generics_no_cancel),*> ::abs_sync::cancellation::TrMayCancel<#lt> for #async_struct<#lt, #(#generics_no_cancel),*>
+        impl<#lt, #(#generics_no_cancel),*> ::abs_sync::may_cancel::TrMayCancel<#lt> for #async_struct<#lt, #(#generics_no_cancel),*>
         #where_clause_no_cancel
         {
             type MayCancelOutput = #output_ty;
 
             fn may_cancel_with<'cancel_, C: ::abs_sync::cancellation::TrCancellationToken>(
                 self,
-                cancel: ::core::pin::Pin<&'cancel_ mut C>,
+                cancel: &'cancel_ mut C,
             ) -> impl ::core::future::Future<Output = Self::MayCancelOutput>
             where
                 Self:'cancel_,
@@ -233,7 +248,7 @@ pub fn gen_may_cancel_future(attr: TokenStream, item: TokenStream) -> TokenStrea
             extern "rust-call" fn async_call_once(self, _: ()) -> Self::CallOnceFuture {
                 let f = unsafe { self.0.get_unchecked_mut() };
                 let p = &mut f.params_;
-                self::#fn_ident(#(p.#field_indices),*, f.cancel_.as_mut())
+                self::#fn_ident(#(p.#field_indices),*, f.cancel_)
             }
         }
     };

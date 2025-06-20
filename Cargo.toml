@@ -1,6 +1,6 @@
 [package]
 name = "gen_mcf_macro"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
@@ -10,7 +10,7 @@ categories = ["no-std"]
 license = "MIT/Apache-2.0"
 readme = "README.md"
 description = """
-A macro working with crate `abs_sync` v0.2 to generate codes and types needed to implement `Future` 
+A macro working with crate `abs_sync` v0.3 to generate codes and types needed to implement `Future` 
 and `TrMayCancel` for a pattern that supports graceful cancellation in async programming.
 """
 
