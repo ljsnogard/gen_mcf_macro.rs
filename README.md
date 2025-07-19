@@ -32,7 +32,7 @@ async fn do_thing_async<'f, A, B, C>(
     b: &'f mut B,
     l: usize,               // copy, ok
     x: &'f Result<A, B>,    // see rule 4
-    cancel: Pin<&'f mut C>, // see rule 2
+    cancel: &'f mut C, // see rule 2
 ) -> usize
 where
     A: Send,
