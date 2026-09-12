@@ -85,14 +85,19 @@ pub fn gen_may_cancel_future(
     let cancel_type_param = generics_all.last().unwrap().clone();
 
     // 将 where 子句中涉及生命周期的、涉及 cancel_token 类型的全部删除，由此得出
-    // async_struct 的泛型约束
-    let where_clause_no_cancel_no_lt = {
+    // async_struct 的泛型约束。
+    //
+    // 注意：这里只删除“最外层引用生命周期”已经被统一成 `last_lt` 的约束。
+    // 对于仍然保留在生成类型里的非最外层生命周期（例如路径泛型参数中的
+    // `Iter<'x, A>`），对应的 `'x: last_lt` 约束必须重新加回，否则生成的结构体
+    // 和 future 无法满足生命周期要求。
+    let where_clause_no_cancel_no_lt_base = {
         let punctuated = where_clause
             .predicates
             .iter()
             .filter(|pred| {
                 !predicate_contains_type_param(pred, &cancel_type_param)
-                    && !predicate_contains_lifetime(pred, &last_lt)
+                    && !predicate_is_lifetime_related(pred, &last_lt)
             })
             .cloned()
             .collect::<Punctuated<_, Token![,]>>();
@@ -108,12 +113,16 @@ pub fn gen_may_cancel_future(
             }
         }
     };
-    // 将 where 子句中涉及生命周期的全部删除，得出 Future 和 FutureState 的泛型约束
-    let where_clause_no_lt = {
+    // 将 where 子句中「纯生命周期」的约束删除（`'a: 'f` 由 add_async_lifetime_bounds
+    // 按需加回），得出 Future 和 FutureState 的泛型约束。类型约束（如
+    // `S: TrBuffSegmMut<'f, T>`）即使引用最后一个生命周期也**保留**——生成的
+    // 类型都携带 `last_lt` 泛型参数，约束仍然成立；若一并删除会导致生成的
+    // future / factory 缺少真实约束（E0277 / E0271）。
+    let where_clause_no_lt_base = {
         let punctuated = where_clause
             .predicates
             .iter()
-            .filter(|pred| !predicate_contains_lifetime(pred, &last_lt))
+            .filter(|pred| !predicate_is_lifetime_related(pred, &last_lt))
             .cloned()
             .collect::<Punctuated<_, Token![,]>>();
         WhereClause {
@@ -236,7 +245,7 @@ pub fn gen_may_cancel_future(
 
     let async_struct = format_ident!("{}Async", prefix_ident);
     let future_struct = format_ident!("{}Future", prefix_ident);
-    let state_struct = format_ident!("{}FutureState", prefix_ident);
+    let factory_trait = format_ident!("__{}FutureFactory", prefix_ident);
 
     // Final generic types
     // let gen_params = quote! { #(#generics_all),* };
@@ -246,15 +255,77 @@ pub fn gen_may_cancel_future(
         _ => panic!("Expected function to return a value"),
     };
 
-    // async_struct 只需要包含字段中实际出现的生命周期；future 需要包含全部
-    // 生命周期，因为 cancel token 字段会使用最后一个生命周期 `last_lt`。
-    let async_lifetimes = collect_used_lifetimes(&types, &lifetimes_all);
+    // 生命周期收集分两部分：
+    // * **字段生命周期**（`field_lifetimes`）：变换后字段类型中出现的生命周期
+    //   （借用统一成 `last_lt` 后的外层引用不计）。这些是 async struct 的泛型
+    //   参数——结构体的生命周期必须出现在字段中，否则 E0392；
+    // * **where 子句生命周期**（`where_lifetimes`）：类型约束中出现的生命周期
+    //   （如 `S: TrBuffSegmMut<'a, T>` 的 `'a`），经 `'a: last_lt` 与 cancel
+    //   token 的借用生命周期关联。它们只出现在约束里，无法作为结构体泛型
+    //   参数（E0392），因此：
+    //   - future / factory / impl 携带全部生命周期（trait 与 impl 不触发
+    //     E0392），并为 where-only 生命周期添加 `PhantomData<&'lt ()>` 标记
+    //     字段；
+    //   - async struct 只携带字段生命周期，其 where 子句过滤掉引用 where-only
+    //     生命周期的谓词。
+    let field_lifetimes = collect_used_lifetimes(&types, &lifetimes_all);
+    let where_lifetimes = collect_used_lifetimes_from_where(where_clause, &lifetimes_all);
+    // 全部生命周期按 **fn 声明顺序** 收集（字段 ∪ where 子句）：生成类型的
+    // 泛型参数顺序必须与用户书写的一致（如 `DevProducerReactAsync<'a, 'f, ...>`），
+    // 否则实例化时生命周期参数错位（E0478）。
+    let all_lifetimes: Vec<Lifetime> = lifetimes_all
+        .iter()
+        .filter(|lt| {
+            field_lifetimes.contains(lt) || where_lifetimes.contains(lt)
+        })
+        .cloned()
+        .collect();
+    let where_only_lifetimes: Vec<Lifetime> = all_lifetimes
+        .iter()
+        .filter(|lt| !field_lifetimes.contains(lt))
+        .cloned()
+        .collect();
+
+    // 把仍然出现在生成类型中的非 `last_lt` 生命周期，重新补上 `lt: last_lt`
+    // 约束。它们不是“最外层引用生命周期”，因此不能在上面的剪裁中被一并丢掉。
+    //
+    // 两份 where 子句（async struct 与 impl 共用 `where_clause_impl`）：
+    // * async struct 携带**全部**生命周期（含 where-only 的 `'a`，经标记字段
+    //   引用）——否则 IntoFuture / TrMayCancel 实现的 self 类型不含 `'a`，
+    //   而关联类型 `ReactThingFuture<'f, 'a, S, ...>` 引用 `'a` → E0207
+    //   （impl 的生命周期必须被 self 类型或 trait 参数约束）；
+    // * future 同样携带全部生命周期。
+    let where_clause_impl =
+        add_async_lifetime_bounds(where_clause_no_cancel_no_lt_base.clone(), &all_lifetimes, &last_lt);
+    let where_clause_no_lt =
+        add_async_lifetime_bounds(where_clause_no_lt_base.clone(), &all_lifetimes, &last_lt);
+
+    // factory trait 的 `make_future` 直接接收 `Pin<&last_lt mut Future<...>>`，
+    // 因此它的 where 子句必须显式包含“非最后生命周期存活不短于 last_lt”
+    // 的关系（如 `'a: 'f`），否则 `&'f mut Future<'a, 'f, ...>` 无法 well-formed。
+    // 这些关系在原始函数里可能只以隐含形式存在，这里按生成类型的生命周期显式补上。
+    let where_clause_factory = {
+        let mut predicates = where_clause_no_lt_base
+            .predicates
+            .iter()
+            .cloned()
+            .collect::<Punctuated<_, Token![,]>>();
+        for lt in &all_lifetimes {
+            if lt.ident != last_lt.ident {
+                predicates.push(parse_quote! { #lt: #last_lt });
+            }
+        }
+        WhereClause {
+            where_token: where_clause.where_token,
+            predicates,
+        }
+    };
     let generic_params_async_no_cancel =
-        build_generic_params(&async_lifetimes, &generics_no_cancel);
+        build_generic_params(&all_lifetimes, &generics_no_cancel);
     let generic_params_future_no_cancel =
-        build_generic_params(&async_lifetimes, &generics_no_cancel);
+        build_generic_params(&all_lifetimes, &generics_no_cancel);
     let generic_params_future_all =
-        build_generic_params(&async_lifetimes, &generics_all);
+        build_generic_params(&all_lifetimes, &generics_all);
 
     let cancel_type_lt_replaced =
         transform_type_outer_lifetime(cancel_type.as_ref().unwrap(), &last_lt);
@@ -269,8 +340,8 @@ pub fn gen_may_cancel_future(
         .iter()
         .map(|idx| format_ident!("p{}", idx.index))
         .collect();
-    // 只生成 (p0, p1, ...) 部分
-    let tuple_pattern = quote! { ( #(#tuple_idents),* ) };
+    // 只生成 (p0, p1, ...) 部分；`..` 忽略追加的 PhantomData 标记字段
+    let tuple_pattern = quote! { ( #(#tuple_idents),*, .. ) };
     let async_struct_destruct = quote! { #async_struct::<#generic_params_async_no_cancel>#tuple_pattern };
 
     // `IntoFuture::IntoFuture` 的类型：`Future<'c, A, B, ..., NonCancellableToken>`。
@@ -278,28 +349,49 @@ pub fn gen_may_cancel_future(
         #future_struct<#generic_params_future_no_cancel, abs_cancel::NonCancellableToken>
     };
 
+    // where-only 生命周期（只出现在约束里、不在字段里）的标记：结构体的
+    // 生命周期参数必须出现在字段中（否则 E0392），因此为它们生成
+    // `_lt_#ident: PhantomData<&'#ident ()>` 字段（先 collect 成 Vec，
+    // 因为构造处（into_future / may_cancel_with / 调用者）要引用多次）。
+    // async struct 与 future 都需要：async struct 携带全部生命周期是为了让
+    // IntoFuture / TrMayCancel 实现的 self 类型引用 `'a`（E0207）。
+    let marker_fields: Vec<_> = where_only_lifetimes.iter().map(|lt| {
+        let name = format_ident!("_lt_{}", lt.ident);
+        quote! { #name: ::core::marker::PhantomData<&#lt ()> }
+    }).collect();
+    let marker_values: Vec<_> = where_only_lifetimes.iter().map(|lt| {
+        let name = format_ident!("_lt_{}", lt.ident);
+        quote! { #name: ::core::marker::PhantomData }
+    }).collect();
+    // async struct 是 tuple struct：标记字段必须是**位置型**（仅类型）。
+    let marker_types: Vec<_> = where_only_lifetimes.iter().map(|lt| {
+        quote! { ::core::marker::PhantomData<&#lt ()> }
+    }).collect();
+    let async_marker_types = &marker_types;
+    let future_marker_fields = &marker_fields;
+    let future_marker_values = &marker_values;
+
     let expanded = quote! {
         // panic!("input_fn 是: {:#?}", input_fn);
         #input_fn
         // panic!("lt_no_last 结构是: {:#?}\ngenerics_no_cancel 结构是: {:#?}", lt_no_last, generics_no_cancel);
-        pub struct #async_struct<#generic_params_async_no_cancel>(#(#fields),*)
-        #where_clause_no_cancel_no_lt;
+        pub struct #async_struct<#generic_params_async_no_cancel>(#(#fields),* #(, #async_marker_types)*)
+        #where_clause_impl;
 
         pub struct #future_struct<#generic_params_future_all>
         #where_clause_no_lt
         {
             params_: ::core::mem::MaybeUninit<#async_struct<#generic_params_async_no_cancel>>,
             cancel_: #cancel_type_lt_replaced,
-            future_: Option<<#state_struct<#generic_params_future_all> as ::core::ops::AsyncFnOnce<()>>::CallOnceFuture>,
+            future_: Option<
+                <() as #factory_trait<#generic_params_future_all>>::MadeFuture
+            >,
+            #(#future_marker_fields),*
         }
-
-        // Declair #state_struct
-        struct #state_struct<#generic_params_future_all>(::core::pin::Pin<&#last_lt mut #future_struct<#generic_params_future_all>>)
-        #where_clause_no_lt;
 
         // Implement `IntoFuture` for #async_struct
         impl<#generic_params_future_no_cancel> ::core::future::IntoFuture for #async_struct<#generic_params_async_no_cancel>
-        #where_clause_no_cancel_no_lt
+        #where_clause_impl
         {
             type IntoFuture = #into_future_ty;
             type Output = #output_ty_transformed;
@@ -309,32 +401,42 @@ pub fn gen_may_cancel_future(
                     params_: ::core::mem::MaybeUninit::new(self),
                     cancel_: abs_cancel::NonCancellableToken::shared_mut(),
                     future_: Option::None,
+                    #(#future_marker_values),*
                 }
             }
         }
 
         // Implement `TrMayCancel<'a>` for #async_struct
         impl<#generic_params_future_no_cancel> abs_cancel::TrMayCancel<#last_lt> for #async_struct<#generic_params_async_no_cancel>
-        #where_clause_no_cancel_no_lt
+        #where_clause_impl
         {
+            type MayCancelFuture<'cancel_, TyCancelTok_GenMcf_> =
+                #future_struct<#generic_params_future_no_cancel, TyCancelTok_GenMcf_>
+            where
+                Self: 'cancel_,
+                TyCancelTok_GenMcf_: abs_cancel::TrCancellationToken + Clone,
+                TyCancelTok_GenMcf_: #last_lt,
+                TyCancelTok_GenMcf_: 'cancel_,
+                'cancel_: #last_lt;
             type MayCancelOutput = #output_ty_transformed;
 
-            fn may_cancel_with<'cancel_, C>(
+            fn may_cancel_with<'cancel_, TyCancelTok_GenMcf_>(
                 self,
-                cancel: &'cancel_ mut C,
-            ) -> impl ::core::future::IntoFuture<Output = Self::MayCancelOutput>
+                cancel: &'cancel_ mut TyCancelTok_GenMcf_,
+            ) -> Self::MayCancelFuture<'cancel_, TyCancelTok_GenMcf_>
             where
                 Self: 'cancel_,
                 // 与 `abs_cancel::TrMayCancel::may_cancel_with` 的 `'f: 'a` 约束对应：
                 // cancel token 的借用必须存活不短于数据生命周期 `last_lt`，
                 // 否则无法以 `&#last_lt mut C` 的形式保存到生成的 future 里。
                 'cancel_: #last_lt,
-                C: abs_cancel::TrCancellationToken + Clone,
+                TyCancelTok_GenMcf_: abs_cancel::TrCancellationToken + Clone,
             {
                 #future_struct {
                     params_: ::core::mem::MaybeUninit::new(self),
                     cancel_: cancel,
                     future_: Option::None,
+                    #(#future_marker_values),*
                 }
             }
         }
@@ -363,10 +465,8 @@ pub fn gen_may_cancel_future(
                         let fut_pin = unsafe { ::core::pin::Pin::new_unchecked(fut) };
                         break fut_pin.poll(cx)
                     } else {
-                        let state = #state_struct(unsafe {
-                            ::core::pin::Pin::new_unchecked(this.as_mut())
-                        });
-                        let fut = AsyncFnOnce::async_call_once(state, ());
+                        let p = unsafe { ::core::pin::Pin::new_unchecked(this.as_mut()) };
+                        let fut = <() as #factory_trait<#generic_params_future_all>>::make_future(p);
                         let fut_field_mut = unsafe { fut_field_ptr.as_mut() };
                         *fut_field_mut = Option::Some(fut);
                     }
@@ -374,21 +474,57 @@ pub fn gen_may_cancel_future(
             }
         }
 
-        impl<#generic_params_future_all> ::core::ops::AsyncFnOnce<()> for #state_struct<#generic_params_future_all>
-        #where_clause_no_lt
-        {
-            type Output = #output_ty_transformed;
-            type CallOnceFuture = impl ::core::future::Future<Output = Self::Output>;
+        trait #factory_trait<#generic_params_future_all> {
+            type MadeFuture: ::core::future::Future;
 
-            extern "rust-call" fn async_call_once(self, _: ()) -> Self::CallOnceFuture {
-                let f = unsafe { self.0.get_unchecked_mut() };
-                let #async_struct_destruct = unsafe { f.params_.assume_init_read() };
-                self::#fn_ident(#(#tuple_idents),*, f.cancel_)
+            fn make_future(
+                f: ::core::pin::Pin<&#last_lt mut #future_struct<#generic_params_future_all>>,
+            ) -> Self::MadeFuture
+            #where_clause_factory;
+        }
+
+        // 工厂 trait 的实现挂在 marker 类型 `()` 上：`()` 没有任何 implied
+        // bound，因此 impl selection 只依赖显式的 where 子句，不再依赖 self
+        // type 的 implied bound（如 `'a: 'f`）。这是 factory trait 能做到的
+        // 最“精准”的形式：泛型参数是命名 `MadeFuture` 所需的最小集合，impl
+        // 对所有生命周期都成立。
+        impl<#generic_params_future_all> #factory_trait<#generic_params_future_all> for ()
+        #where_clause_factory
+        {
+            type MadeFuture = impl ::core::future::Future<Output = #output_ty_transformed>;
+
+            fn make_future(
+                f: ::core::pin::Pin<&#last_lt mut #future_struct<#generic_params_future_all>>,
+            ) -> Self::MadeFuture
+            {
+                let this = unsafe { f.get_unchecked_mut() };
+                let #async_struct_destruct = unsafe { this.params_.assume_init_read() };
+                self::#fn_ident(#(#tuple_idents),*, this.cancel_)
             }
         }
     };
 
     TokenStream::from(expanded)
+}
+
+
+/// 判断谓词是否是「纯生命周期约束」且包含目标生命周期（如 `'a: 'f`）。
+///
+/// 类型约束（`WherePredicate::Type`）即使在其 trait 实参 / 生命周期 bound 中
+/// 引用目标生命周期（如 `S: TrBuffSegmMut<'f, T>`、`S: 'f`）也返回 `false`——
+/// 这类约束必须保留在生成的类型上，否则 `gen_may_cancel_future` 生成的
+/// future / factory 会缺失真实约束（E0277 / E0271）。
+fn predicate_is_lifetime_related(
+    pred: &WherePredicate,
+    target_lt: &Lifetime,
+) -> bool {
+    match pred {
+        WherePredicate::Lifetime(_) => {
+            predicate_contains_lifetime(pred, target_lt)
+        }
+        WherePredicate::Type(_) => false,
+        _ => false,
+    }
 }
 
 /// 判断一个类型中是否包含指定的生命周期
@@ -424,8 +560,83 @@ fn ty_contains_lifetime(ty: &Type, target_lt: &Lifetime) -> bool {
             }
             false
         }
-        // 其他类型（如元组、数组等）可以类似递归，但为简洁略写
+        Type::Tuple(tuple) => {
+            tuple.elems.iter().any(|ty| ty_contains_lifetime(ty, target_lt))
+        }
+        Type::Array(arr) => ty_contains_lifetime(&arr.elem, target_lt),
+        Type::Slice(slice) => ty_contains_lifetime(&slice.elem, target_lt),
+        Type::Paren(paren) => ty_contains_lifetime(&paren.elem, target_lt),
+        Type::Group(group) => ty_contains_lifetime(&group.elem, target_lt),
+        // 可根据需要继续补充其他 Type 变体
         _ => false,
+    }
+}
+
+/// 从 where 子句中收集**真正需要成为泛型参数**的生命周期，保持原声明顺序。
+///
+/// 只收集**类型约束**里出现的生命周期：
+///
+/// * trait 实参（`S: TrBuffSegmMut<'a, T>` 中的 `'a`）；
+/// * 生命周期 bound（`S: 'a` 中的 `'a`）；
+/// * bounded_ty 中**非最外层引用**的生命周期（如 `Vec<'a>: Trait` 的 `'a`）。
+///
+/// **不收集**：
+///
+/// * 纯生命周期约束（`'a: 'f`）——左侧是「最外层引用生命周期」，已被
+///   `transform_type_outer_lifetime` 统一成 `last_lt`，不作为泛型参数；
+///   `'a: last_lt` 存活关系由 [`add_async_lifetime_bounds`] 按收集结果补上；
+/// * bounded_ty 的**最外层引用**生命周期（`&'a X: Trait` 的 `'a`，同样会被
+///   统一成 `last_lt`）。
+fn collect_used_lifetimes_from_where(
+    where_clause: &WhereClause,
+    all_lifetimes: &[Lifetime],
+) -> Vec<Lifetime> {
+    all_lifetimes
+        .iter()
+        .filter(|lt| {
+            where_clause.predicates.iter().any(|pred| {
+                match pred {
+                    WherePredicate::Lifetime(_) => false,
+                    WherePredicate::Type(PredicateType {
+                        bounded_ty, bounds, ..
+                    }) => {
+                        ty_contains_lifetime_skip_outer_ref(bounded_ty, lt)
+                            || bounds.iter().any(|bound| match bound {
+                                TypeParamBound::Lifetime(l) => {
+                                    l.ident == lt.ident
+                                }
+                                TypeParamBound::Trait(t) => {
+                                    ty_contains_lifetime(
+                                        &Type::Path(syn::TypePath {
+                                            qself: None,
+                                            path: t.path.clone(),
+                                        }),
+                                        lt,
+                                    )
+                                }
+                                _ => false,
+                            })
+                    }
+                    _ => false,
+                }
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// 与 [`ty_contains_lifetime`] 相同，但**跳过最外层引用**的生命周期——最外层
+/// 引用生命周期会被 `transform_type_outer_lifetime` 统一成 `last_lt`，不是
+/// 需要保留的泛型参数。
+fn ty_contains_lifetime_skip_outer_ref(
+    ty: &Type,
+    target_lt: &Lifetime,
+) -> bool {
+    match ty {
+        Type::Reference(ty_ref) => {
+            ty_contains_lifetime(&ty_ref.elem, target_lt)
+        }
+        _ => ty_contains_lifetime(ty, target_lt),
     }
 }
 
@@ -611,6 +822,26 @@ fn predicate_contains_type_param(
     }
 }
 
+/// 在 where 子句中补上仍然被生成类型使用的非 `last_lt` 生命周期的存活约束。
+///
+/// `async_lifetimes` 是转换后字段类型中实际出现的生命周期集合；其中的非最后
+/// 生命周期没有被“最外层引用”剪裁掉，因此必须重新声明它们不短于 cancel token
+/// 的生命周期 `last_lt`。
+fn add_async_lifetime_bounds(
+    mut where_clause: WhereClause,
+    async_lifetimes: &[Lifetime],
+    last_lt: &Lifetime,
+) -> WhereClause {
+    for lt in async_lifetimes {
+        if lt.ident != last_lt.ident {
+            where_clause
+                .predicates
+                .push(parse_quote! { #lt: #last_lt });
+        }
+    }
+    where_clause
+}
+
 /// 构建泛型参数列表（生命周期和类型参数），自动添加逗号分隔符
 fn build_generic_params(
     lifetimes: &[Lifetime],
@@ -635,16 +866,34 @@ fn build_generic_params(
     ts
 }
 
-/// 递归地将类型中所有引用生命周期替换为 `new_lt`
+/// 递归地转换类型中的生命周期。
+///
+/// 只有“最外层引用”的生命周期会被统一成 `new_lt`；其余生命周期（例如路径泛型
+/// 参数中的 `'x`、内层引用上的 `'b`）不会被剪裁，而是原样保留，由调用方在
+/// 生成 where 子句时补上 `lt: new_lt` 约束。
 fn transform_type_outer_lifetime(ty: &Type, new_lt: &Lifetime) -> Type {
+    transform_type_outer_lifetime_inner(ty, new_lt, true)
+}
+
+fn transform_type_outer_lifetime_inner(
+    ty: &Type,
+    new_lt: &Lifetime,
+    is_outermost: bool,
+) -> Type {
     match ty {
         Type::Reference(ty_ref) => {
-            // 处理最外层引用：替换生命周期，保持 mut 属性
+            // 只有整个参数类型最外层就是引用时，才替换这个引用上的生命周期。
+            // 内层引用或泛型参数里的引用都保留原生命周期。
             let mut new_ref = ty_ref.clone();
-            new_ref.lifetime = Some(new_lt.clone());
-            // 递归处理内部的元素类型（将内层引用生命周期变为匿名）
-            let inner_transformed =
-                transform_type_outer_lifetime(&ty_ref.elem, new_lt);
+            if is_outermost {
+                new_ref.lifetime = Some(new_lt.clone());
+            }
+            // 进入引用内部后，遇到的引用都不再是“最外层引用”。
+            let inner_transformed = transform_type_outer_lifetime_inner(
+                &ty_ref.elem,
+                new_lt,
+                false,
+            );
             new_ref.elem = Box::new(inner_transformed);
             Type::Reference(new_ref)
         }
@@ -653,7 +902,9 @@ fn transform_type_outer_lifetime(ty: &Type, new_lt: &Lifetime) -> Type {
             let new_elems = tuple
                 .elems
                 .iter()
-                .map(|elem| transform_type_outer_lifetime(elem, new_lt))
+                .map(|elem| {
+                    transform_type_outer_lifetime_inner(elem, new_lt, false)
+                })
                 .collect();
             Type::Tuple(syn::TypeTuple {
                 paren_token: tuple.paren_token,
@@ -661,7 +912,11 @@ fn transform_type_outer_lifetime(ty: &Type, new_lt: &Lifetime) -> Type {
             })
         }
         Type::Array(arr) => {
-            let new_elem = transform_type_outer_lifetime(&arr.elem, new_lt);
+            let new_elem = transform_type_outer_lifetime_inner(
+                &arr.elem,
+                new_lt,
+                false,
+            );
             Type::Array(TypeArray {
                 bracket_token: arr.bracket_token,
                 elem: Box::new(new_elem),
@@ -670,30 +925,43 @@ fn transform_type_outer_lifetime(ty: &Type, new_lt: &Lifetime) -> Type {
             })
         }
         Type::Slice(slice) => {
-            let new_elem = transform_type_outer_lifetime(&slice.elem, new_lt);
+            let new_elem = transform_type_outer_lifetime_inner(
+                &slice.elem,
+                new_lt,
+                false,
+            );
             Type::Slice(syn::TypeSlice {
                 bracket_token: slice.bracket_token,
                 elem: Box::new(new_elem),
             })
         }
         Type::Paren(paren) => {
-            let new_inner = transform_type_outer_lifetime(&paren.elem, new_lt);
+            // 括号不改变“是否最外层引用”的性质。
+            let new_inner = transform_type_outer_lifetime_inner(
+                &paren.elem,
+                new_lt,
+                is_outermost,
+            );
             Type::Paren(syn::TypeParen {
                 paren_token: paren.paren_token,
                 elem: Box::new(new_inner),
             })
         }
         Type::Group(group) => {
-            let new_elem = transform_type_outer_lifetime(&group.elem, new_lt);
+            let new_elem = transform_type_outer_lifetime_inner(
+                &group.elem,
+                new_lt,
+                is_outermost,
+            );
             Type::Group(syn::TypeGroup {
                 group_token: group.group_token,
                 elem: Box::new(new_elem),
             })
         }
         Type::Path(type_path) => {
-            // 处理路径类型，需要递归修改泛型参数中的生命周期
+            // 处理路径类型，需要递归修改泛型参数中的类型；路径泛型参数里的
+            // 生命周期原样保留，不再强行统一成 new_lt。
             let mut new_path = type_path.clone();
-            // 对每个路径段，处理其泛型参数
             #[allow(clippy::single_match)]
             for seg in &mut new_path.path.segments {
                 match &mut seg.arguments {
@@ -708,8 +976,10 @@ fn transform_type_outer_lifetime(ty: &Type, new_lt: &Lifetime) -> Type {
                                 }
                                 GenericArgument::Type(ty) => {
                                     let transformed_ty =
-                                        transform_type_outer_lifetime(
-                                            ty, new_lt,
+                                        transform_type_outer_lifetime_inner(
+                                            ty,
+                                            new_lt,
+                                            false,
                                         );
                                     GenericArgument::Type(transformed_ty)
                                 }
