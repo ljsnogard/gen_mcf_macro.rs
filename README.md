@@ -1,3 +1,7 @@
+# [Notice]
+
+This project is already replaced by [`gen_mcf2`](https://github.com/ljsnogard/gen_mcf2.rs)
+
 ## gen_mcf_macro
 
 Assumed to work with following unstable features:
